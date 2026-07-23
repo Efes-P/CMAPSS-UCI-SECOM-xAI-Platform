@@ -1,63 +1,46 @@
+from dataclasses import dataclass, field
+from typing import List, Optional
 import pandas as pd
-import numpy as np
-from typing import Dict, Any, Tuple
-from src.ports import AssetType, AssetStandardInputDTO
+from src.ports import AssetTelemetryDTO
 
 
+@dataclass
 class CmapssDataIngestionAdapter:
-    """
-    Inbound Adapter: NASA C-MAPSS Ham Veri Yükleme ve Fiziksel Feature Engineering.
-    Ham sensör sütunlarını işleyerek SFC, EGT Margin ve TPR metriklerini türetir.
-    """
+    raw_data_path: Optional[str] = None
+    column_names: List[str] = field(default_factory=lambda: [
+        "unit_number", "time_in_cycles", "setting_1", "setting_2", "setting_3",
+        "s_1", "s_2", "s_3", "s_4", "s_5", "s_6", "s_7", "s_8", "s_9", "s_10",
+        "s_11", "s_12", "s_13", "s_14", "s_15", "s_16", "s_17", "s_18", "s_19",
+        "s_20", "s_21"
+    ])
 
-    def __init__(self, raw_data_path: str = "data/raw_cmapss/train_FD001.txt"):
-        self.raw_data_path = raw_data_path
-        self.column_names = (
-            ["unit_number", "time_in_cycles", "setting_1", "setting_2", "setting_3"]
-            + [f"s_{i}" for i in range(1, 22)]
-        )
-
-    def load_and_preprocess(self, df: pd.DataFrame = None) -> pd.DataFrame:
-        """
-        Ham CMAPSS verisini okur, RUL ve Termodinamik Metrikleri hesaplar.
-        """
-        if df is None:
-            # Gerçek veri dosyasından okuma
+    def load_and_preprocess(self, raw_data: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        if raw_data is not None:
+            df = raw_data.copy()
+        elif self.raw_data_path:
             df = pd.read_csv(self.raw_data_path, sep=r"\s+", header=None, names=self.column_names)
+        else:
+            raise ValueError("Ne DataFrame ne de dosya yolu sağlandı!")
 
-        # 1. RUL (Remaining Useful Life) Hesabı
+        # 1. RUL Hesabı
         max_cycles = df.groupby("unit_number")["time_in_cycles"].transform("max")
         df["RUL"] = max_cycles - df["time_in_cycles"]
+        df["failure_in_window"] = (df["RUL"] <= 30).astype(int)
 
-        # 2. TERMODİNAMİK / FİZİKSEL FEATURE ENGINEERING
-        # A. SFC (Specific Fuel Consumption)
-        df["SFC"] = df["s_12"] * df["s_11"] / (df["s_8"] + 1e-5)
-
-        # B. EGT Margin (Exhaust Gas Temp Margin - Limit ~660K varsayımı)
-        MAX_EGT_LIMIT = 660.0
-        df["EGT_Margin"] = MAX_EGT_LIMIT - df["s_4"]
-
-        # C. TPR (Total Pressure Ratio)
-        df["TPR"] = df["s_11"] / (df["s_2"] + 1e-5)
-
-        # 3. Pencereli Sınıflandırma Etiketi (Örn: Önümüzdeki 20 uçuşta arıza var mı?)
-        LABEL_WINDOW = 20
-        df["failure_in_window"] = (df["RUL"] <= LABEL_WINDOW).astype(int)
+        # 2. Termodinamik Metrik Türetimi
+        df["SFC"] = df["s_16"] / (df["s_11"] + 1e-6)
+        df["EGT_Margin"] = 650.0 - df["s_4"]
+        df["TPR"] = df["s_8"] / (df["s_2"] + 1e-6)
 
         return df
 
-    def extract_single_asset_dto(self, df: pd.DataFrame, unit_id: int, cycle: int) -> AssetStandardInputDTO:
-        """
-        Tek bir motor ve uçuş döngüsü için veriyi çekip Core Engine DTO formatına paketler.
-        """
-        asset_row = df[(df["unit_number"] == unit_id) & (df["time_in_cycles"] == cycle)]
+    def extract_single_asset_dto(self, df: pd.DataFrame, unit_id: int, cycle: int) -> AssetTelemetryDTO:
+        asset_rows = df[(df["unit_number"] == unit_id) & (df["time_in_cycles"] == cycle)]
+        if asset_rows.empty:
+            raise ValueError(f"Motor ID: {unit_id}, Döngü: {cycle} bulunamadı!")
 
-        if asset_row.empty:
-            raise ValueError(f"Motor {unit_id} için cycle {cycle} bulunamadı!")
+        row = asset_rows.iloc[0]
 
-        row = asset_row.iloc[0]
-
-        # Core Engine'e gidecek türetilmiş metrikler
         features = {
             "SFC": float(row["SFC"]),
             "EGT_Margin": float(row["EGT_Margin"]),
@@ -66,35 +49,16 @@ class CmapssDataIngestionAdapter:
             "s_3": float(row["s_3"]),
             "s_4": float(row["s_4"]),
             "s_11": float(row["s_11"]),
-            "s_12": float(row["s_12"]),
+            "s_12": float(row["s_12"])
         }
 
-        return AssetStandardInputDTO(
-            asset_id=f"JetEngine_Unit_{unit_id}_Cycle_{cycle}",
-            asset_type=AssetType.TIME_SERIES_JET_ENGINE,
-            processed_features=features,
-            raw_payload={"true_rul": float(row["RUL"]), "true_failure": int(row["failure_in_window"])},
+        return AssetTelemetryDTO(
+            asset_id=f"CMAPSS_UNIT_{unit_id}",
+            timestamp=float(row["time_in_cycles"]),
+            features=features,
+            raw_payload={
+                "true_rul": float(row["RUL"]),
+                "SFC_raw": float(row["SFC"]),
+                "EGT_Margin_raw": float(row["EGT_Margin"])
+            }
         )
-
-
-# --- BAĞIMSIZ TEST BLOĞU (SINIFIN TAMAMEN DIŞINDA) ---
-if __name__ == "__main__":
-    # Test için sahte CMAPSS verisi
-    mock_raw_data = pd.DataFrame({
-        "unit_number": [1, 1, 1],
-        "time_in_cycles": [10, 20, 30],
-        "setting_1": [0.0, 0.0, 0.0], "setting_2": [0.0, 0.0, 0.0], "setting_3": [100, 100, 100],
-        "s_1": [518.67]*3, "s_2": [642.0]*3, "s_3": [1580.0]*3, "s_4": [1400.0, 1420.0, 1450.0],
-        "s_5": [14.62]*3, "s_6": [21.61]*3, "s_7": [553.0]*3, "s_8": [2388.0]*3,
-        "s_9": [9046.0]*3, "s_10": [1.3]*3, "s_11": [47.2]*3, "s_12": [521.0]*3,
-        "s_13": [2388.0]*3, "s_14": [8138.0]*3, "s_15": [8.4]*3, "s_16": [0.03]*3,
-        "s_17": [392]*3, "s_18": [2388]*3, "s_19": [100]*3, "s_20": [38.8]*3, "s_21": [23.3]*3
-    })
-
-    adapter = CmapssDataIngestionAdapter()
-    processed_df = adapter.load_and_preprocess(mock_raw_data)
-
-    dto = adapter.extract_single_asset_dto(processed_df, unit_id=1, cycle=20)
-
-    print("✅ CMAPSS ADAPTER TEST BAŞARILI!")
-    print(f"Türetilen Metrikler (DTO): {dto.processed_features}")
