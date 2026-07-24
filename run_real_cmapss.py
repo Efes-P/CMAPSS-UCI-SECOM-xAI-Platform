@@ -1,101 +1,241 @@
 import os
 import random
+import time
+import copy
+from typing import Tuple
 import pandas as pd
 import numpy as np
-import xgboost as xgb
-from sklearn.ensemble import HistGradientBoostingRegressor
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import root_mean_squared_error, accuracy_score
+from sklearn.model_selection import GroupShuffleSplit
 
 from src.core_engine import PureHexagonalMaintenanceEngine
 from src.modules.cmapss_engine import CmapssDataIngestionAdapter
 from src.ports import LLMTranslatorPort, MaintenanceReportPayload, MaintenanceModelPort, AssetTelemetryDTO
 
 
-# Sadece FD004 için Custom Asymmetric Loss Function
-# XGBoost sample_weight kullandığımız için imzaya (y_true, y_pred, sample_weight=None) ekliyoruz!
-def asymmetric_mse_objective(y_true, y_pred, sample_weight=None):
-    grad = y_pred - y_true
-    hess = np.ones_like(y_true)
+# ----------------------------------------------------
+# ⚖️ ASİMETRİK C-MAPSS HAVACILIK LOSS FONKSİYONU
+# ----------------------------------------------------
+class AsymmetricCMAPSSLoss(nn.Module):
+    def __init__(self):
+        super(AsymmetricCMAPSSLoss, self).__init__()
 
-    # İyimser tahminlerin (Geç uyarı: Tahmin > Gerçek) türev cezasını 5 katına çıkar
-    late_mask = y_pred > y_true
-    grad[late_mask] = grad[late_mask] * 5.0
-    hess[late_mask] = 5.0
-
-    if sample_weight is not None:
-        grad *= sample_weight
-        hess *= sample_weight
-
-    return grad, hess
-
-
-class EnsembleRegressorAdapter(MaintenanceModelPort):
-    def __init__(self, is_fd004: bool = False):
-        self.xgb_model = None
-        self.hgb_model = None
-        self.classifier = None
-        self.is_fd004 = is_fd004
-
-    def train_models(self, X_train: pd.DataFrame, y_rul: pd.Series, y_fail: pd.Series, sample_weights: pd.Series):
-        if self.is_fd004:
-            # FD004 ÖZEL ASİMETRİK XGBOOST REGRESSOR
-            self.xgb_model = xgb.XGBRegressor(
-                n_estimators=450,
-                max_depth=5,
-                learning_rate=0.02,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                objective=asymmetric_mse_objective,
-                random_state=42
-            )
-        else:
-            # DİĞER SETLER İÇİN STANDART XGBOOST REGRESSOR
-            self.xgb_model = xgb.XGBRegressor(
-                n_estimators=350,
-                max_depth=6,
-                learning_rate=0.025,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42
-            )
-
-        self.xgb_model.fit(X_train, y_rul, sample_weight=sample_weights)
-
-        # HistGradientBoosting
-        self.hgb_model = HistGradientBoostingRegressor(
-            max_iter=350 if self.is_fd004 else 300,
-            max_depth=6,
-            learning_rate=0.025 if self.is_fd004 else 0.03,
-            random_state=42
+    def forward(self, y_pred, y_true):
+        diff = y_pred - y_true
+        loss = torch.where(
+            diff < 0,
+            torch.exp(-diff / 13.0) - 1.0,
+            torch.exp(diff / 10.0) - 1.0
         )
-        self.hgb_model.fit(X_train, y_rul, sample_weight=sample_weights)
+        return torch.mean(loss)
 
-        # XGBoost Classifier
-        self.classifier = xgb.XGBClassifier(
-            n_estimators=200 if self.is_fd004 else 150,
-            max_depth=5,
-            learning_rate=0.03 if self.is_fd004 else 0.05,
-            random_state=42
+
+# ----------------------------------------------------
+# 🧠 SOTA MİMARİ: 1D-CNN + LSTM HYBRID NETWORK
+# ----------------------------------------------------
+class CmapssCNNLSTMNetwork(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int = 64, num_layers: int = 2):
+        super(CmapssCNNLSTMNetwork, self).__init__()
+        self.conv1d = nn.Conv1d(in_channels=input_dim, out_channels=32, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+
+        self.lstm = nn.LSTM(
+            input_size=32,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.2
         )
-        self.classifier.fit(X_train, y_fail)
+
+        self.fc_rul = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+        self.fc_risk = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x_conv = x.transpose(1, 2)
+        x_conv = self.relu(self.conv1d(x_conv))
+        x_conv = x_conv.transpose(1, 2)
+
+        out, _ = self.lstm(x_conv)
+        last_hidden = out[:, -1, :]
+
+        pred_rul = self.fc_rul(last_hidden)
+        pred_risk = self.fc_risk(last_hidden)
+        return pred_rul.squeeze(-1), pred_risk.squeeze(-1)
+
+
+# ----------------------------------------------------
+# 🔌 OPTİMİZE DEEP TEMPORAL ADAPTER (GROUP-AWARE SPLIT + EARLY STOPPING)
+# ----------------------------------------------------
+class DeepTemporalModelAdapter(MaintenanceModelPort):
+    def __init__(self, sequence_length: int = 30):
+        self.sequence_length = sequence_length
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = None
+        self.feature_history = []
+        self.feature_cols = []
+
+    def fit_model(self, X_seq: np.ndarray, y_rul: np.ndarray, y_fail: np.ndarray, groups: np.ndarray,
+                  max_epochs: int = 100, batch_size: int = 64, patience: int = 8,
+                  hidden_dim: int = 64, num_layers: int = 2, pos_weight_val: float = 4.0):
+        input_dim = X_seq.shape[2]
+        self.model = CmapssCNNLSTMNetwork(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers).to(self.device)
+
+        # 🔒 GroupShuffleSplit: aynı motorun sequence'ları train VE val'e bölünmüyor (Bug #1 fix)
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=42)
+        train_idx, val_idx = next(gss.split(X_seq, y_rul, groups=groups))
+
+        X_tr, X_val = X_seq[train_idx], X_seq[val_idx]
+        y_rul_tr, y_rul_val = y_rul[train_idx], y_rul[val_idx]
+        y_fail_tr, y_fail_val = y_fail[train_idx], y_fail[val_idx]
+
+        train_dataset = TensorDataset(
+            torch.tensor(X_tr, dtype=torch.float32),
+            torch.tensor(y_rul_tr, dtype=torch.float32),
+            torch.tensor(y_fail_tr, dtype=torch.float32)
+        )
+        val_dataset = TensorDataset(
+            torch.tensor(X_val, dtype=torch.float32),
+            torch.tensor(y_rul_val, dtype=torch.float32),
+            torch.tensor(y_fail_val, dtype=torch.float32)
+        )
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=1e-5)
+
+        criterion_rul = AsymmetricCMAPSSLoss()
+        pos_weight = torch.tensor([pos_weight_val]).to(self.device)
+        criterion_risk = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        print(
+            f"   ⚡ Deep CNN-LSTM Eğitimi Başladı ({self.device} üzerinde | Max Epochs: {max_epochs} | "
+            f"Batch: {batch_size} | Patience: {patience} | Hidden: {hidden_dim})...")
+
+        best_val_loss = float('inf')
+        best_model_wts = copy.deepcopy(self.model.state_dict())
+        patience_counter = 0
+
+        for epoch in range(1, max_epochs + 1):
+            self.model.train()
+            train_loss = 0.0
+            for bx, by_rul, by_fail in train_loader:
+                bx, by_rul, by_fail = bx.to(self.device), by_rul.to(self.device), by_fail.to(self.device)
+
+                optimizer.zero_grad()
+                pred_rul, pred_risk = self.model(bx)
+
+                loss_rul = criterion_rul(pred_rul, by_rul)
+                loss_risk = criterion_risk(pred_risk, by_fail)
+                loss = (loss_rul / 50.0) + 50.0 * loss_risk
+
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+
+            train_loss /= len(train_loader)
+
+            self.model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for bx, by_rul, by_fail in val_loader:
+                    bx, by_rul, by_fail = bx.to(self.device), by_rul.to(self.device), by_fail.to(self.device)
+                    pred_rul, pred_risk = self.model(bx)
+
+                    loss_rul = criterion_rul(pred_rul, by_rul)
+                    loss_risk = criterion_risk(pred_risk, by_fail)
+                    loss = (loss_rul / 50.0) + 50.0 * loss_risk
+                    val_loss += loss.item()
+
+            val_loss /= len(val_loader)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_wts = copy.deepcopy(self.model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print(f"   🛑 Early Stopping Tetiklendi! Epoch {epoch}'da eğitim durduruldu. En iyi model ağırlıkları yüklendi.")
+                break
+
+        self.model.load_state_dict(best_model_wts)
+        self.model.eval()
 
     def predict_rul(self, features: dict) -> float:
-        df_feat = pd.DataFrame([features])
-        pred_xgb = self.xgb_model.predict(df_feat)[0]
-        pred_hgb = self.hgb_model.predict(df_feat)[0]
+        if not self.feature_cols:
+            self.feature_cols = list(features.keys())
 
-        # FD004 için XGBoost'un asimetrik tahminine daha fazla ağırlık veriyoruz (%70 XGB / %30 HGB)
-        if self.is_fd004:
-            ensemble_pred = 0.7 * pred_xgb + 0.3 * pred_hgb
+        current_feat_vector = [features[c] for c in self.feature_cols]
+        self.feature_history.append(current_feat_vector)
+
+        if len(self.feature_history) > self.sequence_length:
+            self.feature_history.pop(0)
+
+        feat_arr = np.array(self.feature_history, dtype=np.float32)
+        if len(feat_arr) < self.sequence_length:
+            pad_len = self.sequence_length - len(feat_arr)
+            pad = np.tile(feat_arr[0], (pad_len, 1))
+            seq = np.vstack([pad, feat_arr])
         else:
-            ensemble_pred = 0.5 * pred_xgb + 0.5 * pred_hgb
+            seq = feat_arr
 
-        return max(0.0, float(ensemble_pred))
+        seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            pred_rul, _ = self.model(seq_tensor)
+
+        return max(0.0, float(pred_rul.item()))
 
     def predict_failure_risk(self, features: dict) -> float:
-        df_feat = pd.DataFrame([features])
-        prob = self.classifier.predict_proba(df_feat)[0][1]
-        return float(prob)
+        feat_arr = np.array(self.feature_history, dtype=np.float32)
+        if len(feat_arr) < self.sequence_length:
+            pad_len = self.sequence_length - len(feat_arr)
+            pad = np.tile(feat_arr[0], (pad_len, 1))
+            seq = np.vstack([pad, feat_arr])
+        else:
+            seq = feat_arr
+
+        seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            _, pred_risk = self.model(seq_tensor)
+
+        return float(pred_risk.item())
+
+    def predict_batch_unit(self, unit_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        data = unit_df[self.feature_cols].values
+        num_rows = len(data)
+        sequences = []
+
+        for i in range(num_rows):
+            if i < self.sequence_length - 1:
+                pad_len = self.sequence_length - (i + 1)
+                pad = np.tile(data[0], (pad_len, 1))
+                seq = np.vstack([pad, data[:i + 1]])
+            else:
+                seq = data[i - self.sequence_length + 1: i + 1]
+            sequences.append(seq)
+
+        batch_tensor = torch.tensor(np.array(sequences, dtype=np.float32)).to(self.device)
+        with torch.no_grad():
+            preds_rul, preds_risk = self.model(batch_tensor)
+
+        return torch.clamp(preds_rul, min=0.0).cpu().numpy(), preds_risk.cpu().numpy()
 
 
 class SimpleLLMAdapter(LLMTranslatorPort):
@@ -105,13 +245,26 @@ class SimpleLLMAdapter(LLMTranslatorPort):
         return payload
 
 
+# ----------------------------------------------------
+# 🎛️ DATASET'E ÖZGÜ HİPERPARAMETRELER (Bug #4 fix)
+# FD002/FD004: 6 operating condition -> daha büyük kapasite + daha sabırlı early stopping
+# ----------------------------------------------------
+DATASET_CONFIGS = {
+    "FD001": dict(hidden_dim=64,  num_layers=2, sequence_length=30, patience=8,  pos_weight=4.0),
+    "FD003": dict(hidden_dim=64,  num_layers=2, sequence_length=30, patience=8,  pos_weight=4.0),
+    "FD002": dict(hidden_dim=96,  num_layers=2, sequence_length=35, patience=12, pos_weight=3.0),
+    "FD004": dict(hidden_dim=128, num_layers=2, sequence_length=40, patience=15, pos_weight=3.0),
+}
+
+
 if __name__ == "__main__":
+    start_time = time.time()
+
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     raw_data_dir = os.path.join(BASE_DIR, "data", "raw_cmapss")
 
-    print("🚀 C-MAPSS CANLI SİMÜLASYON VE AKADEMİK METRİK TESTİ (FD004 ASİMETRİK KALKANLI)\n")
+    print("🚀 C-MAPSS CANLI SİMÜLASYON VE AKADEMİK METRİK TESTİ (SOTA CNN-LSTM + GROUP-AWARE SPLIT + REGIME CLUSTERING)\n")
 
-    ingestion_adapter = CmapssDataIngestionAdapter(base_dir=raw_data_dir, window_size=30)
     llm_adapter = SimpleLLMAdapter()
 
     datasets = ["FD001", "FD002", "FD003", "FD004"]
@@ -122,35 +275,45 @@ if __name__ == "__main__":
     overall_y_pred_class = []
 
     for ds in datasets:
-        is_fd004 = (ds == "FD004")
+        cfg = DATASET_CONFIGS[ds]
 
-        # 1. Model Eğitimi
+        # ⚠️ Her dataset kendi ingestion adapter'ını alır: regime_model, active_sensors, scaler
+        #    dataset'ler arasında karışmasın diye.
+        ingestion_adapter = CmapssDataIngestionAdapter(base_dir=raw_data_dir, window_size=30)
+
         train_df = ingestion_adapter.load_and_preprocess_single_set(ds)
+        test_df = ingestion_adapter.load_and_preprocess_test_single_set(ds)
 
         exclude_cols = ["unit_number", "time_in_cycles", "setting_1", "setting_2", "setting_3", "dataset", "RUL",
-                        "failure_in_window", "sample_weight", "end_rul", "op_cluster"]
+                        "failure_in_window", "end_rul", "true_rul", "regime"]
         feature_cols = [c for c in train_df.columns if c not in exclude_cols]
 
-        X_train = train_df[feature_cols]
-        y_rul_train = train_df["RUL"]
-        y_fail_train = train_df["failure_in_window"]
-        weights = train_df["sample_weight"]
+        print(f"\n🔥 {ds} Seti İçin Jenerik Deep Temporal Model Eğitiliyor (seq_len={cfg['sequence_length']}, "
+              f"hidden={cfg['hidden_dim']}, patience={cfg['patience']})...")
 
-        # FD004 için özel asimetrik modlu adapter örneklenecek
-        model_adapter = EnsembleRegressorAdapter(is_fd004=is_fd004)
-        model_adapter.train_models(X_train, y_rul_train, y_fail_train, sample_weights=weights)
+        X_seq_train, y_rul_train, y_fail_train, groups_train = ingestion_adapter.create_lstm_sequences(
+            train_df, feature_cols, sequence_length=cfg["sequence_length"]
+        )
+
+        model_adapter = DeepTemporalModelAdapter(sequence_length=cfg["sequence_length"])
+        model_adapter.feature_cols = feature_cols
+
+        model_adapter.fit_model(
+            X_seq_train, y_rul_train, y_fail_train, groups_train,
+            max_epochs=100, batch_size=64, patience=cfg["patience"],
+            hidden_dim=cfg["hidden_dim"], num_layers=cfg["num_layers"], pos_weight_val=cfg["pos_weight"]
+        )
 
         engine = PureHexagonalMaintenanceEngine(
             model_port=model_adapter,
             llm_port=llm_adapter
         )
 
-        # 2. Test Verisi
-        test_df = ingestion_adapter.load_and_preprocess_test_single_set(ds)
-
         # ----------------------------------------------------
         # BÖLÜM A: RASTGELE SEÇİLEN MOTORUN SİMÜLASYONU
         # ----------------------------------------------------
+        model_adapter.feature_history.clear()  # 🔒 Bug #5 fix: dataset/unit geçişinde state sızıntısı olmasın
+
         available_units = test_df["unit_number"].unique()
         selected_unit = random.choice(available_units)
 
@@ -162,12 +325,14 @@ if __name__ == "__main__":
             f"{'Cycle':<8} | {'Gerçek RUL':<10} | {'Tahmin RUL':<10} | {'Risk (%)':<10} | {'Consensus Durumu':<24} | {'Işık'}")
         print("-" * 85)
 
-        for idx, row in unit_df.iterrows():
+        sim_preds_rul, sim_preds_risk = model_adapter.predict_batch_unit(unit_df)
+
+        for idx, row in unit_df.reset_index(drop=True).iterrows():
             c = int(row["time_in_cycles"])
             features = {col: float(row[col]) for col in feature_cols if col in row}
 
-            pred_rul = model_adapter.predict_rul(features)
-            risk_pct = model_adapter.predict_failure_risk(features) * 100
+            pred_rul = float(sim_preds_rul[idx])
+            risk_pct = float(sim_preds_risk[idx]) * 100
 
             dto = AssetTelemetryDTO(
                 asset_id=f"CMAPSS_{ds}_UNIT_{selected_unit}",
@@ -197,27 +362,23 @@ if __name__ == "__main__":
         # ----------------------------------------------------
         # BÖLÜM B: TÜM TEST MOTORLARININ GENEL METRİKLERİ
         # ----------------------------------------------------
-        last_cycles_df = test_df.groupby("unit_number").last().reset_index()
+        y_true_ds, y_pred_ds, y_true_fail_ds, y_pred_fail_ds = [], [], [], []
 
-        y_true_ds = []
-        y_pred_ds = []
-        y_true_fail_ds = []
-        y_pred_fail_ds = []
+        for unit_id, unit_test_df in test_df.groupby("unit_number"):
+            preds_rul, preds_risk = model_adapter.predict_batch_unit(unit_test_df)
 
-        for idx, row in last_cycles_df.iterrows():
-            if pd.isna(row["true_rul"]):
+            last_row = unit_test_df.iloc[-1]
+            if pd.isna(last_row["true_rul"]):
                 continue
 
-            features = {col: float(row[col]) for col in feature_cols if col in row}
-            p_rul = model_adapter.predict_rul(features)
-            p_risk = model_adapter.predict_failure_risk(features)
+            t_rul = float(last_row["true_rul"])
+            final_pred_rul = float(preds_rul[-1])
+            final_pred_risk = float(preds_risk[-1])
 
-            t_rul = float(row["true_rul"])
             y_true_ds.append(t_rul)
-            y_pred_ds.append(p_rul)
-
+            y_pred_ds.append(final_pred_rul)
             y_true_fail_ds.append(1 if t_rul <= 30 else 0)
-            y_pred_fail_ds.append(1 if p_risk >= 0.5 else 0)
+            y_pred_fail_ds.append(1 if final_pred_risk >= 0.5 else 0)
 
         rmse_ds = root_mean_squared_error(y_true_ds, y_pred_ds)
         acc_ds = accuracy_score(y_true_fail_ds, y_pred_fail_ds) * 100
@@ -232,15 +393,18 @@ if __name__ == "__main__":
         print(f"   • Kritik Arıza Yakalama (Accuracy): %{acc_ds:.1f}")
         print("=" * 85)
 
-    # ----------------------------------------------------
-    # BÖLÜM C: NİHAİ GENEL ÖZET
-    # ----------------------------------------------------
     total_rmse = root_mean_squared_error(overall_y_true_rul, overall_y_pred_rul)
     total_acc = accuracy_score(overall_y_true_class, overall_y_pred_class) * 100
+
+    end_time = time.time()
+    total_seconds = int(end_time - start_time)
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
 
     print("\n🎯 TÜM SETLER GENEL HİBRİT ÖZETİ:")
     print(f"   • Genel RUL RMSE Skor : {total_rmse:.2f} Uçuş")
     print(f"   • Genel Arıza Accuracy: %{total_acc:.1f}")
+    print(f"   ⏱️ Toplam Çalışma Süresi: {minutes} Dakika {seconds} Saniye")
     print("=" * 85)
 
     print("\n✅ SİMÜLASYON VE AKADEMİK METRİK TESTİ BAŞARIYLA TAMAMLANDI!")
